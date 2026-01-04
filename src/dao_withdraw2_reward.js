@@ -1,5 +1,6 @@
-// src/dao_withdraw_phase2_reward.js
+// src/dao_withdraw2_reward.js
 // Node >= 18 (global fetch + AbortController)
+import {  formatCKB, freeCapacity } from './ckb_capacity.js';
 
 const RPC_URL = process.env.RPC_URL || 'http://127.0.0.1:8114';
 
@@ -23,6 +24,7 @@ async function rpc(method, params, { timeoutMs = 30_000, retries = 3 } = {}) {
       return json.result;
     } catch (e) {
       lastErr = e;
+      // 打印失败，避免“无声”
       console.error(`[rpc] ${method} attempt ${i}/${retries} failed:`, e?.message || e);
       await new Promise(r => setTimeout(r, 300 * i));
     } finally {
@@ -50,14 +52,42 @@ function isDaoTypeScript(type) {
   );
 }
 
-/* ----------------------- formatting ----------------------- */
+// prepare-withdraw cell: output_data != 0x000..00
+function isPrepareDaoData(dataHex) {
+  return !!dataHex && dataHex !== '0x0000000000000000';
+}
 
-function formatCKB(shannons) {
-  const v = shannons < 0n ? -shannons : shannons;
-  const sign = shannons < 0n ? '-' : '';
-  const whole = v / 100_000_000n;
-  const frac = v % 100_000_000n;
-  return `${sign}${whole.toString()}.${frac.toString().padStart(8, '0')}`;
+// withdraw2：outputs 不应再包含 DAO cell（关键过滤条件）
+function outputsContainDaoCell(tx) {
+  for (const o of tx?.outputs || []) {
+    if (o?.type && isDaoTypeScript(o.type)) return true;
+  }
+  return false;
+}
+
+/* ----------------------- DAO header parsing ----------------------- */
+
+function parseDaoAR(daoHex) {
+  const buf = Buffer.from(daoHex.slice(2), 'hex');
+  return buf.readBigUInt64LE(8);
+}
+
+/* ----------------------- prepare data parsing ----------------------- */
+
+// prepare-withdraw cell: output_data is u64 little-endian = deposit block number
+function parsePrepareBlockNumberHex(outputData) {
+  if (!outputData || outputData === '0x') {
+    throw new Error(`invalid output_data for prepare-withdraw: ${outputData}`);
+  }
+  const hex = outputData.startsWith('0x') ? outputData.slice(2) : outputData;
+  if (hex.length !== 16) {
+    throw new Error(
+      `prepare output_data must be 8 bytes (16 hex), got len=${hex.length}: ${outputData}`
+    );
+  }
+  const buf = Buffer.from(hex, 'hex');
+  const bn = buf.readBigUInt64LE(0);
+  return '0x' + bn.toString(16);
 }
 
 /* ----------------------- concurrency helper ----------------------- */
@@ -74,46 +104,63 @@ async function mapLimit(arr, limit, fn) {
   await Promise.all(workers);
 }
 
+/* ----------------------- caches ----------------------- */
+
+// get_transaction cache
+const txCache = new Map();
+
+async function getTx(txHash) {
+  if (txCache.has(txHash)) return txCache.get(txHash);
+  const v = await rpc('get_transaction', [txHash], { timeoutMs: 120_000, retries: 5 });
+  txCache.set(txHash, v);
+  return v;
+}
+
+// AR cache by block_number hex
+const arCache = new Map();
+
+async function getARByBlockNumberHex(bnHex) {
+  if (arCache.has(bnHex)) return arCache.get(bnHex);
+  const h = await rpc('get_header_by_number', [bnHex], { timeoutMs: 120_000, retries: 5 });
+  const ar = parseDaoAR(h.dao);
+  arCache.set(bnHex, ar);
+  return ar;
+}
+
 /* ----------------------- core: withdraw2 reward ----------------------- */
 
-async function computeWithdrawPhase2Reward() {
-  const pageLimit      = process.env.WITHDRAW2_TX_LIMIT || '0x3e8';
-  const CONCURRENCY    = Number(process.env.WITHDRAW2_TX_CONCURRENCY || '60');
-  const LOG_EVERY      = Number(process.env.WITHDRAW2_LOG_EVERY || '20000');
+async function computeWithdraw2Reward() {
+  const pageLimit = process.env.WITHDRAW2_TX_LIMIT || '0x3e8';
+  const CONCURRENCY = Number(process.env.WITHDRAW2_TX_CONCURRENCY || '60');
+  const LOG_EVERY = Number(process.env.WITHDRAW2_LOG_EVERY || '20000');
   const PAGE_LOG_EVERY = Number(process.env.WITHDRAW2_PAGE_LOG_EVERY || '50');
 
-  // 默认开启：只在 page 日志页打印（最多 PRINT_TX_MAX 条）
+  // page 日志页打印 tx +（最多）若干条 input 明细
   const PRINT_TX = (process.env.WITHDRAW2_PRINT_TX ?? '1') === '1';
-  const PRINT_TX_MAX = Number(process.env.WITHDRAW2_PRINT_TX_MAX || '5');
+  const PRINT_TX_MAX = Number(process.env.WITHDRAW2_PRINT_TX_MAX || '3');   // 每个 page 最多打印几笔 tx 明细
+  const PRINT_INPUT_MAX = Number(process.env.WITHDRAW2_PRINT_INPUT_MAX || '50'); // 每笔 tx 最多打印多少个 DAO inputs
+
+  // 抽样打印 multi-input tx（prepare_inputs > 1）的明细（tx 维度）
+  const PRINT_MULTI_TX_MAX = Number(process.env.WITHDRAW2_PRINT_MULTI_TX_MAX || '10');
 
   const blockFrom = process.env.WITHDRAW2_BLOCK_RANGE_FROM || null;
-  const blockTo   = process.env.WITHDRAW2_BLOCK_RANGE_TO   || null;
+  const blockTo = process.env.WITHDRAW2_BLOCK_RANGE_TO || null;
 
   console.log('--------------------------------');
   console.log('[withdraw2] start scan');
-  console.log('[withdraw2] RPC_URL           =', RPC_URL);
-  console.log('[withdraw2] page_limit        =', pageLimit);
-  console.log('[withdraw2] concurrency       =', CONCURRENCY);
-  console.log('[withdraw2] log_every         =', LOG_EVERY);
-  console.log('[withdraw2] page_log_every    =', PAGE_LOG_EVERY);
-  if (blockFrom && blockTo) console.log('[withdraw2] block_range       =', `[${blockFrom}, ${blockTo})`);
-
-  // tx cache
-  const txCache = new Map();
-  async function getTx(txHash) {
-    if (txCache.has(txHash)) return txCache.get(txHash);
-    const v = await rpc('get_transaction', [txHash], { timeoutMs: 120_000, retries: 5 });
-    txCache.set(txHash, v);
-    return v;
-  }
-
-  // 过滤条件：二阶段 withdraw 的 outputs 不应再含 DAO cell
-  function outputsContainDaoCell(tx) {
-    for (const o of tx?.outputs || []) {
-      if (o?.type && isDaoTypeScript(o.type)) return true;
-    }
-    return false;
-  }
+  console.log('[withdraw2] RPC_URL              =', RPC_URL);
+  console.log('[withdraw2] page_limit           =', pageLimit);
+  console.log('[withdraw2] concurrency          =', CONCURRENCY);
+  console.log('[withdraw2] log_every            =', LOG_EVERY);
+  console.log('[withdraw2] page_log_every       =', PAGE_LOG_EVERY);
+  if (blockFrom && blockTo) console.log('[withdraw2] block_range          =', `[${blockFrom}, ${blockTo})`);
+  console.log(
+    '[withdraw2] print_tx             =',
+    PRINT_TX,
+    `max_tx_per_page=${PRINT_TX_MAX}`,
+    `max_inputs_per_tx=${PRINT_INPUT_MAX}`
+  );
+  console.log('[withdraw2] print_multi_tx_max   =', PRINT_MULTI_TX_MAX);
 
   let cursor = null;
   let page = 0;
@@ -121,8 +168,14 @@ async function computeWithdrawPhase2Reward() {
   let seenObjects = 0;
   let seenInputObjects = 0;
 
+  // 全局 tx 去重：避免同一 tx 被 objects 重复打到
+  const seenTx = new Set();
+
   let withdraw2Txs = 0;
   let totalReward = 0n;
+
+  // multi-input 抽样：存 txHash（只存唯一 tx）
+  const multiSamples = [];
 
   const started = Date.now();
 
@@ -130,11 +183,7 @@ async function computeWithdrawPhase2Reward() {
     page++;
     const shouldLogPage = page % PAGE_LOG_EVERY === 0;
 
-    const searchKey = {
-      script: DAO_TYPE,
-      script_type: 'type',
-      // 不使用 group_by_transaction
-    };
+    const searchKey = { script: DAO_TYPE, script_type: 'type' };
     if (blockFrom && blockTo) searchKey.block_range = [blockFrom, blockTo];
 
     const params = [searchKey, 'desc', pageLimit];
@@ -161,7 +210,10 @@ async function computeWithdrawPhase2Reward() {
         cntInput++;
         seenInputObjects++;
         const h = o.tx_hash ?? o.txHash;
-        if (h) inputTxHashes.push(h);
+        if (h && !seenTx.has(h)) {
+          seenTx.add(h);
+          inputTxHashes.push(h);
+        }
       } else if (ioType === 'output') {
         cntOutput++;
       } else {
@@ -171,69 +223,125 @@ async function computeWithdrawPhase2Reward() {
 
     if (shouldLogPage) {
       console.log(
-        `[withdraw2] page=${page} objs=${objs.length} ` +
-        `dist input=${cntInput} output=${cntOutput} other=${cntOther} (${dt}s)`
+        `[withdraw2] page=${page} objs=${objs.length} dist input=${cntInput} output=${cntOutput} other=${cntOther} (${dt}s)`
       );
     }
 
     let withdrawInPage = 0;
     let rewardInPage = 0n;
 
-    // page 日志页才收集 txLines（不然就不浪费内存/字符串拼接）
-    let txLines = null;
-    let txPrinted = 0;
-    if (PRINT_TX && shouldLogPage) txLines = [];
+    // page 日志页：最多打印几笔 tx 的明细
+    const pageTxDetailLines = [];
+    let pageTxPrinted = 0;
 
     await mapLimit(inputTxHashes, CONCURRENCY, async (txHash) => {
       const wrap = await getTx(txHash);
       const tx = wrap?.transaction;
       if (!tx) return;
 
+      // 二阶段 withdraw：outputs 不应再包含 DAO cell
       if (outputsContainDaoCell(tx)) return;
-      if ((tx.inputs?.length || 0) !== 1) return;
-      if ((tx.outputs?.length || 0) !== 1) return;
 
-      const prev = tx.inputs[0]?.previous_output;
-      if (!prev?.tx_hash) return;
+      // 扫 inputs：逐个找 prepare-withdraw DAO cell
+      let prepareInputs = 0;
+      let txRewardSum = 0n;
 
-      const prevWrap = await getTx(prev.tx_hash);
-      const ptx = prevWrap?.transaction;
-      if (!ptx?.outputs?.length) return;
+      // 收集每个 input 的明细（只用于打印/抽样，不影响统计）
+      const perInputDetails = [];
 
-      const idx = Number(prev.index);
-      const prevOut = ptx.outputs[idx];
-      const prevData = (ptx.outputs_data || [])[idx];
+      const inputs = tx.inputs || [];
+      for (let inIdx = 0; inIdx < inputs.length; inIdx++) {
+        const inp = inputs[inIdx];
+        const prev = inp?.previous_output;
+        if (!prev?.tx_hash) continue;
 
-      // prevOut 必须是 DAO cell
-      if (!prevOut?.type || !isDaoTypeScript(prevOut.type)) return;
+        // prevTx = prepare tx
+        const prevWrap = await getTx(prev.tx_hash);
+        const ptx = prevWrap?.transaction;
+        const pStatus = prevWrap?.tx_status;
 
-      // prevOut 必须是 prepare-withdraw（data != 0x000..00）
-      if (!prevData || prevData === '0x0000000000000000') return;
+        if (!ptx?.outputs?.length) continue;
 
-      const outCap = BigInt(tx.outputs[0].capacity);
-      const inCap  = BigInt(prevOut.capacity);
-      const delta  = outCap - inCap;
+        const outIndex = Number(prev.index);
+        const prevOut = ptx.outputs[outIndex];
+        const prevData = (ptx.outputs_data || [])[outIndex];
 
-      if (delta > 0n) {
-        totalReward += delta;
-        rewardInPage += delta;
+        // 必须是 DAO type
+        if (!prevOut?.type || !isDaoTypeScript(prevOut.type)) continue;
 
-        if (txLines && txPrinted < PRINT_TX_MAX) {
-          txPrinted++;
-          txLines.push(
-            `[withdraw2-tx] page=${page} tx=${txHash} reward=${formatCKB(delta)} CKB`
-          );
+        // 必须是 prepare-withdraw cell（data 存 deposit block number）
+        if (!isPrepareDaoData(prevData)) continue;
+
+        // prepare height j：用 prepare tx 的确认高度（最可靠）
+        const prepareBnHex = pStatus?.block_number;
+        if (!prepareBnHex) continue;
+
+        const depositBnHex = parsePrepareBlockNumberHex(prevData);
+
+        // AR_i / AR_j
+        const AR_i = await getARByBlockNumberHex(depositBnHex);
+        const AR_j = await getARByBlockNumberHex(prepareBnHex);
+
+        // free capacity of the DAO cell (per CKB consensus)
+        const free = freeCapacity(prevOut, prevData);
+        if (free <= 0n) continue;
+
+        // reward_i = (free * AR_j) / AR_i - free
+        const reward = (free * AR_j) / AR_i - free;
+        if (reward <= 0n) continue;
+
+        prepareInputs++;
+        txRewardSum += reward;
+
+        if (perInputDetails.length < PRINT_INPUT_MAX) {
+          perInputDetails.push({
+            input_index: inIdx,
+            prev_tx_hash: prev.tx_hash,
+            prev_index: prev.index,
+            deposit_bn: depositBnHex,
+            prepare_bn: prepareBnHex,
+            free,
+            reward,
+          });
         }
       }
+
+      if (prepareInputs === 0) return;
+
+      // 统计：按“每个 input cell 的 reward”累加（per-cell）
+      totalReward += txRewardSum;
+      rewardInPage += txRewardSum;
 
       withdraw2Txs++;
       withdrawInPage++;
 
+      // multi-input 抽样（tx 维度）
+      if (prepareInputs > 1 && multiSamples.length < PRINT_MULTI_TX_MAX) {
+        multiSamples.push({ txHash, prepareInputs, txRewardSum, perInputDetails });
+      }
+
+      // 只在 page 日志页打印 tx + 每个 input 的 reward 明细（限量）
+      if (PRINT_TX && shouldLogPage && pageTxPrinted < PRINT_TX_MAX) {
+        pageTxPrinted++;
+
+        pageTxDetailLines.push(
+          `[withdraw2-tx] page=${page} tx: ${txHash} prepare_inputs=${prepareInputs} reward_sum=${formatCKB(txRewardSum)} CKB`
+        );
+
+        for (const d of perInputDetails) {
+          pageTxDetailLines.push(
+            `  [withdraw2-input] tx: ${txHash} input_index=${d.input_index}` +
+            ` prev_tx=${d.prev_tx_hash}:${d.prev_index}` +
+            ` deposit_bn=${d.deposit_bn} prepare_bn=${d.prepare_bn}` +
+            ` free=${formatCKB(d.free)} reward=${formatCKB(d.reward)} CKB`
+          );
+        }
+      }
+
       if (withdraw2Txs % LOG_EVERY === 0) {
         const elapsed = ((Date.now() - started) / 1000).toFixed(1);
         console.log(
-          `[progress] withdraw2=${withdraw2Txs} ` +
-          `total_reward=${formatCKB(totalReward)} CKB elapsed=${elapsed}s`
+          `[progress] withdraw2=${withdraw2Txs} total_reward=${formatCKB(totalReward)} CKB elapsed=${elapsed}s`
         );
       }
     });
@@ -242,12 +350,10 @@ async function computeWithdrawPhase2Reward() {
       const elapsedAll = ((Date.now() - started) / 1000).toFixed(1);
       console.log(
         `[withdraw2] page=${page} withdraw2=${withdrawInPage} ` +
-        `reward_page=${formatCKB(rewardInPage)} CKB ` +
-        `total=${formatCKB(totalReward)} CKB elapsed=${elapsedAll}s`
+        `reward_page=${formatCKB(rewardInPage)} CKB total=${formatCKB(totalReward)} CKB elapsed=${elapsedAll}s`
       );
-
-      if (txLines && txLines.length > 0) {
-        console.log(txLines.join('\n'));
+      if (PRINT_TX && pageTxDetailLines.length > 0) {
+        console.log(pageTxDetailLines.join('\n'));
       }
     }
 
@@ -257,10 +363,32 @@ async function computeWithdrawPhase2Reward() {
   }
 
   const elapsed = ((Date.now() - started) / 1000).toFixed(1);
+
+  // 先打印 multi-input samples（保持你当前顺序诉求）
+  if (multiSamples.length > 0) {
+    console.log('--------------------------------');
+    console.log('[withdraw2] multi-input samples (per input details):');
+    for (const s of multiSamples) {
+      console.log(
+        `[withdraw2-multi] tx: ${s.txHash} prepare_inputs=${s.prepareInputs} reward_sum=${formatCKB(s.txRewardSum)} CKB`
+      );
+      for (const d of s.perInputDetails) {
+        console.log(
+          `  [withdraw2-input] tx: ${s.txHash} input_index=${d.input_index}` +
+          ` prev_tx=${d.prev_tx_hash}:${d.prev_index}` +
+          ` deposit_bn=${d.deposit_bn} prepare_bn=${d.prepare_bn}` +
+          ` free=${formatCKB(d.free)} reward=${formatCKB(d.reward)} CKB`
+        );
+      }
+    }
+  }
+
+  // 最后打印 withdraw2 汇总结果
   console.log('--------------------------------');
   console.log('[withdraw2] done');
   console.log('[withdraw2] seen objects         =', seenObjects);
   console.log('[withdraw2] seen input objects   =', seenInputObjects);
+  console.log('[withdraw2] unique tx processed  =', seenTx.size);
   console.log('[withdraw2] withdraw2 txs        =', withdraw2Txs);
   console.log('[withdraw2] withdraw2 reward     =', formatCKB(totalReward), 'CKB');
   console.log('[withdraw2] elapsed              =', elapsed, 's');
@@ -271,11 +399,10 @@ async function computeWithdrawPhase2Reward() {
 /* ----------------------- main/entry ----------------------- */
 
 async function main() {
-  console.log('[entry] dao_withdraw_phase2_reward.js start');
+  console.log('[entry] dao_withdraw2_reward.js start');
   const tip = await rpc('get_indexer_tip', [], { timeoutMs: 30_000, retries: 3 });
   console.log('[entry] indexer_tip =', tip);
-
-  await computeWithdrawPhase2Reward();
+  await computeWithdraw2Reward();
 }
 
 main().catch((e) => {

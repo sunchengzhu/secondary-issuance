@@ -1,3 +1,5 @@
+import { occupiedCapacity } from './ckb_capacity.js';
+
 const RPC_URL = process.env.RPC_URL || 'http://127.0.0.1:8114';
 const LIMIT_CELLS = process.env.LIMIT || '0x64'; // get_cells page size
 
@@ -71,32 +73,6 @@ function formatCKB(shannons) {
   const whole = v / 100_000_000n;
   const frac = v % 100_000_000n;
   return `${sign}${whole.toString()}.${frac.toString().padStart(8, '0')}`;
-}
-
-/* ----------------------- Occupied capacity ----------------------- */
-
-const SHANNONS_PER_BYTE = 100_000_000n;
-
-function hexBytesLen(hex) {
-  if (!hex || hex === '0x') return 0;
-  return (hex.length - 2) / 2;
-}
-
-function scriptSizeBytes(script) {
-  const argsLen = hexBytesLen(script?.args || '0x');
-  // rough-but-correct molecule sizing
-  return 4 + 12 + 32 + 1 + 4 + argsLen;
-}
-
-function cellSizeBytes(output, dataHex) {
-  const lockSize = scriptSizeBytes(output.lock);
-  const typeSize = output.type ? (1 + scriptSizeBytes(output.type)) : 1;
-  const dataSize = 4 + hexBytesLen(dataHex);
-  return 4 + 8 + lockSize + typeSize + dataSize + 8;
-}
-
-function occupiedCapacity(output, dataHex) {
-  return BigInt(cellSizeBytes(output, dataHex)) * SHANNONS_PER_BYTE;
 }
 
 /* ----------------------- get_cells (DAO live) ----------------------- */
