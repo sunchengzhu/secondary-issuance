@@ -118,6 +118,34 @@ async function* getDaoLiveCells() {
   }
 }
 
+// deposit cell: output_data == 0x0000000000000000
+function isDepositCell(outputData) {
+  return outputData === '0x0000000000000000';
+}
+
+// prepare-withdraw cell: output_data is u64 little-endian = prepare block number
+function parsePrepareBlockNumberHex(outputData) {
+  // outputData should be 8 bytes (16 hex chars) + 0x
+  if (!outputData || outputData === '0x') {
+    throw new Error(`invalid output_data for prepare-withdraw: ${outputData}`);
+  }
+  const hex = outputData.startsWith('0x') ? outputData.slice(2) : outputData;
+  if (hex.length !== 16) {
+    throw new Error(`prepare output_data must be 8 bytes (16 hex), got len=${hex.length}: ${outputData}`);
+  }
+  const buf = Buffer.from(hex, 'hex');
+  const bn = buf.readBigUInt64LE(0); // BigInt
+  return '0x' + bn.toString(16);
+}
+
+async function getARByBlockNumberHex(bnHex, arCache) {
+  if (arCache.has(bnHex)) return arCache.get(bnHex);
+  const h = await rpc('get_header_by_number', [bnHex], { timeoutMs: 120_000, retries: 5 });
+  const ar = parseDaoAR(h.dao);
+  arCache.set(bnHex, ar);
+  return ar;
+}
+
 /* ----------------------- main ----------------------- */
 
 async function main() {
@@ -129,10 +157,13 @@ async function main() {
   console.log('AR             =', AR.toString());
   console.log('S              =', S.toString());
 
-  let daoDeposit = 0n;
-  let unclaimed = 0n;
-
   const arCache = new Map();
+
+  let daoDeposit = 0n;
+  let unclaimedDeposit = 0n;
+  let unclaimedPrepare = 0n;
+  let cntDeposit = 0;
+  let cntPrepare = 0;
 
   for await (const c of getDaoLiveCells()) {
     const cap = BigInt(c.output.capacity);
@@ -140,26 +171,45 @@ async function main() {
     const free = cap - occ;
 
     daoDeposit += cap;
+    if (free <= 0n) continue;
 
-    if (!arCache.has(c.block_number)) {
-      const h = await rpc('get_header_by_number', [c.block_number]);
-      arCache.set(c.block_number, parseDaoAR(h.dao));
-    }
+    if (c.output_data === '0x0000000000000000') {
+      // ---- deposit cell ----
+      cntDeposit++;
 
-    if (free > 0n) {
-      const AR_deposit = arCache.get(c.block_number);
-      const reward = (free * AR) / AR_deposit - free;
-      if (reward > 0n) unclaimed += reward;
+      // deposit height i = c.block_number
+      const AR_i = await getARByBlockNumberHex(c.block_number, arCache);
+
+      // tip height k = indexer tip
+      const reward = (free * AR) / AR_i - free; // AR is tip AR_k
+      if (reward > 0n) unclaimedDeposit += reward;
+
+    } else {
+      // ---- prepare-withdraw cell ----
+      cntPrepare++;
+
+      // deposit height i is stored in output_data
+      const depositBnHex = parsePrepareBlockNumberHex(c.output_data);
+      const AR_i = await getARByBlockNumberHex(depositBnHex, arCache);
+
+      // prepare height j = c.block_number (this cell created at prepare tx)
+      const AR_j = await getARByBlockNumberHex(c.block_number, arCache);
+
+      const reward = (free * AR_j) / AR_i - free;
+      if (reward > 0n) unclaimedPrepare += reward;
     }
   }
 
-  console.log('--------------------------------');
-  console.log('DAO deposit             =', formatCKB(daoDeposit), 'CKB');
-  console.log('DAO unclaimed rewards   =', formatCKB(unclaimed), 'CKB');
+  const unclaimedTotal = unclaimedDeposit + unclaimedPrepare;
 
-  if (unclaimed <= S) {
-    const burn = S - unclaimed;
-    console.log('Treasury burn           =', formatCKB(burn), 'CKB');
+  console.log('--------------------------------');
+  console.log('DAO unclaimed rewards deposit =', formatCKB(unclaimedDeposit), 'CKB', `(cells=${cntDeposit})`);
+  console.log('DAO unclaimed rewards prepare =', formatCKB(unclaimedPrepare), 'CKB', `(cells=${cntPrepare})`);
+  console.log('DAO unclaimed rewards total   =', formatCKB(unclaimedTotal), 'CKB');
+
+  if (unclaimedTotal <= S) {
+    const burn = S - unclaimedTotal;
+    console.log('Treasury burn                 =', formatCKB(burn), 'CKB');
   } else {
     console.error('❌ Sanity check failed: UnclaimedDAO > S');
   }
