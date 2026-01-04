@@ -1,0 +1,14 @@
+{
+  "name": "secondary-issuance",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Compute unclaimed CKB DAO rewards using local indexer live cells via JSON-RPC.",
+  "scripts": {
+    "dao": "node src/dao_unclaimed.js",
+    "miner": "node src/miner_reward.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
