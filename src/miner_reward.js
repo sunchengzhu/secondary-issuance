@@ -1,217 +1,269 @@
-// src/miner_reward.js
-// Node >= 18
-//
-// Miner reward = sum of block.transactions[0].outputs[0].capacity
-// from height 0 to (tip - END_OFFSET), using JSON-RPC batch.
-// Supports checkpoint resume.
-
-import fs from "fs";
-import path from "path";
+#!/usr/bin/env node
+/**
+ * Accurate total secondary issuance paid to miners from genesis..tip (mainnet),
+ * using ONLY block headers:
+ *
+ * miner_secondary_i = floor( s_i * U_{i-1} / C_{i-1} )
+ *
+ * Epoch packed field on YOUR chain (confirmed by samples):
+ *   epoch = (length << 40) | (index << 24) | number
+ *
+ * Extras:
+ *  - Streamed computation (no full header cache) with windowed parallel fetch.
+ *  - Progress printing with speed/ETA.
+ *  - Every 1000 epochs prints samples for first/10th/last block.
+ *
+ * Env:
+ *  - RPC_URL (default http://127.0.0.1:8114)
+ *  - CONCURRENCY (default 16)
+ *  - START (default 1)
+ *  - END (default tip)
+ *  - EPOCH_PRINT_STEP (default 1000)
+ *  - WINDOW_MULT (default 200)  // windowSize = CONCURRENCY * WINDOW_MULT
+ */
 
 const RPC_URL = process.env.RPC_URL || "http://127.0.0.1:8114";
-const BATCH_SIZE = Number(process.env.BATCH_SIZE || "200");
-const END_OFFSET = BigInt(process.env.END_OFFSET || "11");
-const LOG_EVERY_BATCH = Number(process.env.LOG_EVERY_BATCH || "20");
+const CONCURRENCY = Number(process.env.CONCURRENCY || "16");
+const EPOCH_PRINT_STEP = Number(process.env.EPOCH_PRINT_STEP || "1000");
+const WINDOW_MULT = Number(process.env.WINDOW_MULT || "200");
 
-// checkpoint file path
-const CHECKPOINT_FILE =
-  process.env.CHECKPOINT_FILE || path.join(process.cwd(), "miner_reward.checkpoint.json");
+// Mainnet constant (shannons per epoch). Adjust if you run a different chain.
+const SECONDARY_EPOCH_REWARD = 61_369_863_013_698n;
 
-// write checkpoint every N batches (default 1 = every batch)
-const CHECKPOINT_EVERY_BATCH = Number(process.env.CHECKPOINT_EVERY_BATCH || "1");
+async function rpc(method, params, { timeoutMs = 30_000, retries = 3 } = {}) {
+  const body = { id: 42, jsonrpc: "2.0", method, params };
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+      const res = await fetch(RPC_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: ac.signal,
+      });
+      clearTimeout(t);
 
-/* ---------------- helpers ---------------- */
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      if (json.error) throw new Error(`RPC error: ${JSON.stringify(json.error)}`);
+      return json.result;
+    } catch (e) {
+      clearTimeout(t);
+      if (attempt === retries) throw e;
+      await new Promise((r) => setTimeout(r, 200 * attempt));
+    }
+  }
+}
+
+async function getHeaderByNumber(n) {
+  return rpc("get_header_by_number", ["0x" + n.toString(16)]);
+}
+
+function u64leFromHex16(hex16) {
+  const buf = Buffer.from(hex16, "hex");
+  let x = 0n;
+  for (let i = 0; i < 8; i++) x |= BigInt(buf[i]) << (8n * BigInt(i));
+  return x;
+}
+
+function parseDao(daoHex) {
+  const h = daoHex.startsWith("0x") ? daoHex.slice(2) : daoHex;
+  if (h.length !== 64) throw new Error(`dao field must be 32 bytes, got hexlen=${h.length}`);
+  const seg = (i) => h.slice(i * 16, (i + 1) * 16);
+  const C = u64leFromHex16(seg(0));
+  const U = u64leFromHex16(seg(3));
+  return { C, U };
+}
+
+// ✅ Your chain: epoch = (length<<40) | (index<<24) | number
+function parseEpochPacked(epochHex) {
+  const e = BigInt(epochHex);
+  const length = Number(e >> 40n);                 // high 24 bits
+  const index  = Number((e >> 24n) & 0xFFFFn);     // middle 16 bits
+  const number = Number(e & 0xFFFFFFn);            // low 24 bits
+  return { number, index, length };
+}
+
+function perBlockSecondary(epochLength, epochIndex) {
+  const L = BigInt(epochLength);
+  if (L === 0n) throw new RangeError("Division by zero (epoch.length=0)");
+  const q = SECONDARY_EPOCH_REWARD / L;
+  const m = SECONDARY_EPOCH_REWARD % L;
+  const idx = BigInt(epochIndex);
+  return idx < m ? (q + 1n) : q;
+}
+
+function formatCkbFromShannon(shannon) {
+  const sign = shannon < 0n ? "-" : "";
+  const x = shannon < 0n ? -shannon : shannon;
+  const CKB = 100_000_000n;
+  const intPart = x / CKB;
+  const frac = x % CKB;
+  const fracStr = frac.toString().padStart(8, "0").replace(/0+$/, "");
+  return fracStr.length ? `${sign}${intPart}.${fracStr}` : `${sign}${intPart}`;
+}
+
+function fmtHMS(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  return `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}:${s
+    .toString()
+    .padStart(2, "0")}`;
+}
+
+function printProgress(done, total, startAt) {
+  const now = Date.now();
+  const elapsedSec = (now - startAt) / 1000;
+  const speed = elapsedSec > 0 ? done / elapsedSec : 0;
+  const pct = (done / total) * 100;
+  const remain = total - done;
+  const etaSec = speed > 0 ? remain / speed : 0;
+  console.log(
+    `Processed blocks: ${done.toLocaleString()} / ${total.toLocaleString()} ` +
+    `(${pct.toFixed(2)}%) | ${speed.toFixed(0)} blk/s | ETA ${fmtHMS(etaSec)}`
+  );
+}
+
+function shouldPrintEpoch(epochNumber) {
+  return EPOCH_PRINT_STEP > 0 && epochNumber % EPOCH_PRINT_STEP === 0;
+}
 
 function toHex(n) {
-  return "0x" + BigInt(n).toString(16);
+  return "0x" + n.toString(16);
 }
 
-function formatCKB(shannons) {
-  const whole = shannons / 100_000_000n;
-  const frac = shannons % 100_000_000n;
-  return `${whole}.${frac.toString().padStart(8, "0")}`;
+function printCheckSample({ label, blockNumber, epoch, s_i, Cprev, Uprev, miner_i }) {
+  const ratio = Cprev === 0n ? 0 : Number(Uprev) / Number(Cprev);
+  const displayBlock = blockNumber + 11;
+
+  console.log("==== CHECK SAMPLE ====");
+  console.log(`label              = ${label}`);
+  console.log(`epoch_number        = ${epoch.number}`);
+  console.log(`block_number        = ${blockNumber} (${toHex(blockNumber)})`);
+  console.log(`epoch_index         = ${epoch.index}`);
+  console.log(`epoch_length        = ${epoch.length}`);
+  console.log(`epoch_packed        = ${epoch.raw}`);
+  console.log(`per_block_secondary = ${s_i} shannons (${formatCkbFromShannon(s_i)} CKB)`);
+  console.log(`prev_C              = ${Cprev}`);
+  console.log(`prev_U              = ${Uprev}`);
+  console.log(`U_over_C            = ${ratio.toFixed(12)}`);
+  console.log(`miner_secondary     = ${miner_i} shannons (${formatCkbFromShannon(miner_i)} CKB)`);
+
+  // ✅ what you asked for: +11 block number
+  console.log(`reward_display_blk  = ${displayBlock} (${toHex(displayBlock)})`);
+
+  console.log("======================");
 }
-
-function extractMinerReward(block) {
-  if (!block) return null;
-  const tx0 = block.transactions?.[0];
-  if (!tx0) return null;
-  const out0 = tx0.outputs?.[0];
-  if (!out0 || out0.capacity == null) return null;
-  return BigInt(out0.capacity);
-}
-
-async function rpcSingle(method, params, { timeoutMs = 60_000 } = {}) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const res = await fetch(RPC_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: 1, jsonrpc: "2.0", method, params }),
-      signal: ctrl.signal,
-    });
-    const json = await res.json();
-    if (json.error) throw new Error(`${method} error: ${JSON.stringify(json.error)}`);
-    return json.result;
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-async function rpcBatch(calls, { timeoutMs = 120_000 } = {}) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const res = await fetch(RPC_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(calls),
-      signal: ctrl.signal,
-    });
-    return await res.json(); // array
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-async function getTip() {
-  const header = await rpcSingle("get_tip_header", []);
-  return {
-    tipHex: header.number,
-    tipDec: BigInt(header.number),
-    tipHash: header.hash,
-  };
-}
-
-/* ---------------- checkpoint I/O ---------------- */
-
-function loadCheckpoint() {
-  if (!fs.existsSync(CHECKPOINT_FILE)) return null;
-  try {
-    const raw = fs.readFileSync(CHECKPOINT_FILE, "utf8");
-    const j = JSON.parse(raw);
-    if (typeof j.next_height !== "string" || typeof j.sum_shannons !== "string") return null;
-    return {
-      nextHeight: BigInt(j.next_height),
-      sum: BigInt(j.sum_shannons),
-      endHeight: j.end_height != null ? BigInt(j.end_height) : null,
-      updatedAt: j.updated_at || null,
-    };
-  } catch {
-    return null;
-  }
-}
-
-function atomicWriteJson(filePath, obj) {
-  const tmp = `${filePath}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2));
-  fs.renameSync(tmp, filePath);
-}
-
-function saveCheckpoint({ nextHeight, sum, endHeight }) {
-  atomicWriteJson(CHECKPOINT_FILE, {
-    next_height: nextHeight.toString(),
-    sum_shannons: sum.toString(),
-    end_height: endHeight.toString(),
-    updated_at: new Date().toISOString(),
-  });
-}
-
-/* ---------------- main ---------------- */
 
 async function main() {
-  const { tipHex, tipDec, tipHash } = await getTip();
-  const endHeight = tipDec - END_OFFSET;
+  const tip = await rpc("get_tip_header", []);
+  const tipNumber = Number(BigInt(tip.number));
 
-  console.log("RPC_URL        =", RPC_URL);
-  console.log("TIP_HEIGHT     =", tipDec.toString(), `(hex=${tipHex})`);
-  console.log("TIP_HASH       =", tipHash);
-  console.log("END_HEIGHT     =", endHeight.toString(), `(tip-${END_OFFSET.toString()})`);
-  console.log("BATCH_SIZE     =", BATCH_SIZE);
-  console.log("CHECKPOINT     =", CHECKPOINT_FILE);
-  console.log("--------------------------------");
+  const start = Number(process.env.START || "1");
+  const end = Number(process.env.END || String(tipNumber));
+  if (start < 1) throw new Error("START must be >= 1 (needs previous header)");
+  if (end > tipNumber) throw new Error(`END (${end}) > tip (${tipNumber})`);
 
-  // resume
-  let startHeight = 0n;
-  let sum = 0n;
+  console.log(`RPC_URL=${RPC_URL}`);
+  console.log(`Range: [${start}, ${end}] (tip=${tipNumber})`);
+  console.log(`CONCURRENCY=${CONCURRENCY}`);
+  console.log(`EPOCH_PRINT_STEP=${EPOCH_PRINT_STEP}`);
+  console.log(`WINDOW_MULT=${WINDOW_MULT}`);
+  console.log(`SECONDARY_EPOCH_REWARD=${SECONDARY_EPOCH_REWARD} shannons/epoch`);
 
-  const ckpt = loadCheckpoint();
-  if (ckpt) {
-    // 如果 endHeight 变了（tip 变了），也可以继续跑：我们只需跑到新的 endHeight
-    startHeight = ckpt.nextHeight;
-    sum = ckpt.sum;
-    console.log(
-      `[resume] next_height=${startHeight.toString()} sum=${formatCKB(sum)} CKB updated_at=${ckpt.updatedAt || "?"}`
-    );
+  let prevHeader = await getHeaderByNumber(start - 1);
+
+  let totalMinerSecondary = 0n;
+  const totalBlocks = end - start + 1;
+  let processed = 0;
+
+  // epochNumber -> Set<index>
+  const printed = new Map();
+  const markPrinted = (ep, idx) => {
+    let s = printed.get(ep);
+    if (!s) printed.set(ep, (s = new Set()));
+    s.add(idx);
+  };
+  const isPrinted = (ep, idx) => (printed.get(ep)?.has(idx) ?? false);
+
+  const t0 = Date.now();
+
+  let cur = start;
+  const windowSize = Math.max(1, CONCURRENCY * WINDOW_MULT);
+
+  while (cur <= end) {
+    const winFrom = cur;
+    const winTo = Math.min(end, winFrom + windowSize - 1);
+    const count = winTo - winFrom + 1;
+
+    const out = new Array(count);
+    let next = winFrom;
+
+    async function worker() {
+      while (true) {
+        const n = next++;
+        if (n > winTo) return;
+        const h = await getHeaderByNumber(n);
+        out[n - winFrom] = h;
+      }
+    }
+
+    await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
+
+    for (let k = 0; k < out.length; k++) {
+      const i = winFrom + k;
+      const curHeader = out[k];
+
+      const { C: Cprev, U: Uprev } = parseDao(prevHeader.dao);
+
+      if (typeof curHeader.epoch !== "string") {
+        console.error("BAD header.epoch type at block", i, "epoch=", curHeader.epoch);
+        process.exit(1);
+      }
+
+      const ep = parseEpochPacked(curHeader.epoch);
+      ep.raw = curHeader.epoch;
+
+      if (!Number.isFinite(ep.length) || ep.length <= 0) {
+        console.error("BAD epoch length at block", i, "epoch=", curHeader.epoch);
+        console.error("parsed epoch=", ep);
+        console.error("header=", curHeader);
+        process.exit(1);
+      }
+
+      const s_i = perBlockSecondary(ep.length, ep.index);
+      const miner_i = (s_i * Uprev) / Cprev;
+      totalMinerSecondary += miner_i;
+
+      if (shouldPrintEpoch(ep.number)) {
+        const wantIdxs = [0, 10, Math.max(0, ep.length - 1)];
+        if (wantIdxs.includes(ep.index) && !isPrinted(ep.number, ep.index)) {
+          const label =
+            ep.index === 0 ? "first" :
+              ep.index === 10 ? "tenth" :
+                ep.index === ep.length - 1 ? "last" : `idx_${ep.index}`;
+
+          printCheckSample({ label, blockNumber: i, epoch: ep, s_i, Cprev, Uprev, miner_i });
+          markPrinted(ep.number, ep.index);
+        }
+      }
+
+      processed++;
+      if (processed % 200000 === 0) printProgress(processed, totalBlocks, t0);
+
+      prevHeader = curHeader;
+    }
+
+    cur = winTo + 1;
   }
 
-  if (startHeight > endHeight) {
-    console.log("[done] checkpoint already beyond endHeight, nothing to do.");
-    console.log("Miner reward total =", formatCKB(sum), "CKB");
-    return;
-  }
-
-  let batchCount = 0;
-  const started = Date.now();
-
-  for (let base = startHeight; base <= endHeight; base += BigInt(BATCH_SIZE)) {
-    const calls = [];
-    let actual = 0;
-
-    for (let i = 0; i < BATCH_SIZE; i++) {
-      const h = base + BigInt(i);
-      if (h > endHeight) break;
-      calls.push({
-        id: i,
-        jsonrpc: "2.0",
-        method: "get_block_by_number",
-        params: [toHex(h)],
-      });
-      actual++;
-    }
-
-    const results = await rpcBatch(calls);
-
-    const byId = new Map(results.map((r) => [r.id, r]));
-    for (let i = 0; i < actual; i++) {
-      const r = byId.get(i);
-      if (!r || r.error) continue;
-      const cap = extractMinerReward(r.result);
-      if (cap != null) sum += cap;
-    }
-
-    batchCount++;
-
-    const scanned = base + BigInt(actual); // “已处理到”的下一个高度
-    if (batchCount % CHECKPOINT_EVERY_BATCH === 0) {
-      saveCheckpoint({ nextHeight: scanned, sum, endHeight });
-    }
-
-    if (batchCount % LOG_EVERY_BATCH === 0) {
-      const pct = Number(scanned * 10_000n / (endHeight + 1n)) / 100; // +1 让 0..end 更像“总量”
-      const elapsedSec = (Date.now() - started) / 1000;
-      const speed = Number(scanned - startHeight) / Math.max(1, elapsedSec); // blocks/sec
-      const remaining = Number((endHeight + 1n) - scanned);
-      const etaMin = (remaining / Math.max(1e-9, speed)) / 60;
-
-      console.log(
-        `[progress] scanned<=${scanned.toString()}/${(endHeight + 1n).toString()} (${pct.toFixed(2)}%) ` +
-        `sum=${formatCKB(sum)} CKB ` +
-        `elapsed=${elapsedSec.toFixed(1)}s ETA=${etaMin.toFixed(1)}min`
-      );
-    }
-  }
-
-  // final checkpoint
-  saveCheckpoint({ nextHeight: endHeight + 1n, sum, endHeight });
-
-  const elapsed = ((Date.now() - started) / 1000).toFixed(1);
-  console.log("--------------------------------");
-  console.log("Miner reward total =", sum.toString(), "shannons");
-  console.log("Miner reward total =", formatCKB(sum), "CKB");
-  console.log("Elapsed            =", `${elapsed}s`);
-  console.log(`Checkpoint saved   = ${CHECKPOINT_FILE}`);
+  printProgress(processed, totalBlocks, t0);
+  console.log("---- RESULT ----");
+  console.log(`Total miner secondary (shannons): ${totalMinerSecondary}`);
+  console.log(`Total miner secondary (CKB):     ${formatCkbFromShannon(totalMinerSecondary)} CKB`);
 }
 
 main().catch((e) => {
