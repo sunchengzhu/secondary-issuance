@@ -7,7 +7,7 @@
   "scripts": {
     "unclaimed": "node src/dao_unclaimed.js",
     "miner": "node src/miner_reward.js",
-    "withdraw2": "node src/dao_withdraw2_reward.js",
+    "claimed": "node src/dao_claimed.js",
     "total": "node src/secondary_issuance_total.js"
   },
   "engines": {

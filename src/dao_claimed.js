@@ -1,5 +1,3 @@
-// src/dao_withdraw2_reward.js
-// Node >= 18 (global fetch + AbortController)
 import {  formatCKB, freeCapacity } from './ckb_capacity.js';
 
 const RPC_URL = process.env.RPC_URL || 'http://127.0.0.1:8114';
