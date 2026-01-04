@@ -118,11 +118,6 @@ async function* getDaoLiveCells() {
   }
 }
 
-// deposit cell: output_data == 0x0000000000000000
-function isDepositCell(outputData) {
-  return outputData === '0x0000000000000000';
-}
-
 // prepare-withdraw cell: output_data is u64 little-endian = prepare block number
 function parsePrepareBlockNumberHex(outputData) {
   // outputData should be 8 bytes (16 hex chars) + 0x
