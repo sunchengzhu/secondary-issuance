@@ -55,14 +55,6 @@ function isPrepareDaoData(dataHex) {
   return !!dataHex && dataHex !== '0x0000000000000000';
 }
 
-// withdraw2：outputs 不应再包含 DAO cell（关键过滤条件）
-function outputsContainDaoCell(tx) {
-  for (const o of tx?.outputs || []) {
-    if (o?.type && isDaoTypeScript(o.type)) return true;
-  }
-  return false;
-}
-
 /* ----------------------- DAO header parsing ----------------------- */
 
 function parseDaoAR(daoHex) {
@@ -127,22 +119,26 @@ async function getARByBlockNumberHex(bnHex) {
 
 /* ----------------------- core: withdraw2 reward ----------------------- */
 
+// core: withdraw2 reward (per-DAO-input reward)
 async function computeWithdraw2Reward() {
-  const pageLimit = process.env.WITHDRAW2_TX_LIMIT || '0x3e8';
-  const CONCURRENCY = Number(process.env.WITHDRAW2_TX_CONCURRENCY || '60');
-  const LOG_EVERY = Number(process.env.WITHDRAW2_LOG_EVERY || '20000');
-  const PAGE_LOG_EVERY = Number(process.env.WITHDRAW2_PAGE_LOG_EVERY || '50');
+  const pageLimit        = process.env.WITHDRAW2_TX_LIMIT || '0x3e8';
+  const CONCURRENCY      = Number(process.env.WITHDRAW2_TX_CONCURRENCY || '60');
+  const LOG_EVERY        = Number(process.env.WITHDRAW2_LOG_EVERY || '20000');
+  const PAGE_LOG_EVERY   = Number(process.env.WITHDRAW2_PAGE_LOG_EVERY || '50');
 
   // page 日志页打印 tx +（最多）若干条 input 明细
-  const PRINT_TX = (process.env.WITHDRAW2_PRINT_TX ?? '1') === '1';
-  const PRINT_TX_MAX = Number(process.env.WITHDRAW2_PRINT_TX_MAX || '3');   // 每个 page 最多打印几笔 tx 明细
-  const PRINT_INPUT_MAX = Number(process.env.WITHDRAW2_PRINT_INPUT_MAX || '50'); // 每笔 tx 最多打印多少个 DAO inputs
+  const PRINT_TX         = (process.env.WITHDRAW2_PRINT_TX ?? '1') === '1';
+  const PRINT_TX_MAX     = Number(process.env.WITHDRAW2_PRINT_TX_MAX || '3');       // 每个 page 最多打印几笔 tx 的明细
+  const PRINT_INPUT_MAX  = Number(process.env.WITHDRAW2_PRINT_INPUT_MAX || '50');   // 每笔 tx 最多打印多少个 DAO inputs（防刷屏）
 
-  // 抽样打印 multi-input tx（prepare_inputs > 1）的明细（tx 维度）
+  // 额外：抽样打印 multi-input tx（prepare_inputs > 1）的明细
   const PRINT_MULTI_TX_MAX = Number(process.env.WITHDRAW2_PRINT_MULTI_TX_MAX || '10');
 
+  // ✅ 新增：抽样打印 “withdraw2 但 outputs 仍包含 DAO cell”的 tx（不再过滤 outputs）
+  const PRINT_WITH_DAO_OUTPUTS_MAX = Number(process.env.WITHDRAW2_PRINT_WITH_DAO_OUTPUTS_MAX || '8');
+
   const blockFrom = process.env.WITHDRAW2_BLOCK_RANGE_FROM || null;
-  const blockTo = process.env.WITHDRAW2_BLOCK_RANGE_TO || null;
+  const blockTo   = process.env.WITHDRAW2_BLOCK_RANGE_TO   || null;
 
   console.log('--------------------------------');
   console.log('[withdraw2] start scan');
@@ -152,13 +148,43 @@ async function computeWithdraw2Reward() {
   console.log('[withdraw2] log_every            =', LOG_EVERY);
   console.log('[withdraw2] page_log_every       =', PAGE_LOG_EVERY);
   if (blockFrom && blockTo) console.log('[withdraw2] block_range          =', `[${blockFrom}, ${blockTo})`);
-  console.log(
-    '[withdraw2] print_tx             =',
-    PRINT_TX,
-    `max_tx_per_page=${PRINT_TX_MAX}`,
-    `max_inputs_per_tx=${PRINT_INPUT_MAX}`
-  );
+  console.log('[withdraw2] print_tx             =', PRINT_TX, `max_tx_per_page=${PRINT_TX_MAX}`, `max_inputs_per_tx=${PRINT_INPUT_MAX}`);
   console.log('[withdraw2] print_multi_tx_max   =', PRINT_MULTI_TX_MAX);
+  console.log('[withdraw2] print_with_dao_outputs_max =', PRINT_WITH_DAO_OUTPUTS_MAX);
+
+  function isDaoType(type) {
+    return (
+      type &&
+      type.code_hash === DAO_TYPE.code_hash &&
+      type.hash_type === DAO_TYPE.hash_type &&
+      (type.args || '0x') === (DAO_TYPE.args || '0x')
+    );
+  }
+
+  // prepare-withdraw cell: output_data != 0x000..00
+  function isPrepareDaoData(dataHex) {
+    return !!dataHex && dataHex !== '0x0000000000000000';
+  }
+
+  // withdraw2（以前用于过滤）：outputs 是否仍包含 DAO cell
+  function outputsContainDaoCell(tx) {
+    for (const o of tx?.outputs || []) {
+      if (o?.type && isDaoType(o.type)) return true;
+    }
+    return false;
+  }
+
+  async function mapLimit(arr, limit, fn) {
+    let i = 0;
+    const workers = Array.from({ length: limit }, async () => {
+      while (true) {
+        const idx = i++;
+        if (idx >= arr.length) return;
+        await fn(arr[idx], idx);
+      }
+    });
+    await Promise.all(workers);
+  }
 
   let cursor = null;
   let page = 0;
@@ -166,7 +192,7 @@ async function computeWithdraw2Reward() {
   let seenObjects = 0;
   let seenInputObjects = 0;
 
-  // 全局 tx 去重：避免同一 tx 被 objects 重复打到
+  // ✅ 全局 tx 去重：避免同一 tx 被 objects 重复打到
   const seenTx = new Set();
 
   let withdraw2Txs = 0;
@@ -174,6 +200,9 @@ async function computeWithdraw2Reward() {
 
   // multi-input 抽样：存 txHash（只存唯一 tx）
   const multiSamples = [];
+
+  // ✅ 新增：withdraw2 但 outputs 仍含 DAO 的抽样
+  const daoOutputsSamples = [];
 
   const started = Date.now();
 
@@ -237,8 +266,8 @@ async function computeWithdraw2Reward() {
       const tx = wrap?.transaction;
       if (!tx) return;
 
-      // 二阶段 withdraw：outputs 不应再包含 DAO cell
-      if (outputsContainDaoCell(tx)) return;
+      // ✅ 不再过滤 outputsContainDaoCell(tx)，只记录用于抽样
+      const hasDaoOutputs = outputsContainDaoCell(tx);
 
       // 扫 inputs：逐个找 prepare-withdraw DAO cell
       let prepareInputs = 0;
@@ -265,7 +294,7 @@ async function computeWithdraw2Reward() {
         const prevData = (ptx.outputs_data || [])[outIndex];
 
         // 必须是 DAO type
-        if (!prevOut?.type || !isDaoTypeScript(prevOut.type)) continue;
+        if (!prevOut?.type || !isDaoType(prevOut.type)) continue;
 
         // 必须是 prepare-withdraw cell（data 存 deposit block number）
         if (!isPrepareDaoData(prevData)) continue;
@@ -280,7 +309,9 @@ async function computeWithdraw2Reward() {
         const AR_i = await getARByBlockNumberHex(depositBnHex);
         const AR_j = await getARByBlockNumberHex(prepareBnHex);
 
-        // free capacity of the DAO cell (per CKB consensus)
+        // ✅ free capacity：必须用正确的 molecule sizing
+        //    这里假设你已经引入了 freeCapacity(output, dataHex)
+        //    如果你仍然是 cap-occ，也可以替换成：const free = BigInt(prevOut.capacity) - occupiedCapacity(prevOut, prevData);
         const free = freeCapacity(prevOut, prevData);
         if (free <= 0n) continue;
 
@@ -306,7 +337,7 @@ async function computeWithdraw2Reward() {
 
       if (prepareInputs === 0) return;
 
-      // 统计：按“每个 input cell 的 reward”累加（per-cell）
+      // ✅ 统计：按 “每个 input cell 的 reward” 累加
       totalReward += txRewardSum;
       rewardInPage += txRewardSum;
 
@@ -318,7 +349,12 @@ async function computeWithdraw2Reward() {
         multiSamples.push({ txHash, prepareInputs, txRewardSum, perInputDetails });
       }
 
-      // 只在 page 日志页打印 tx + 每个 input 的 reward 明细（限量）
+      // ✅ 新增：withdraw2 但 outputs 仍包含 DAO 的 tx 抽样（不影响统计）
+      if (hasDaoOutputs && daoOutputsSamples.length < PRINT_WITH_DAO_OUTPUTS_MAX) {
+        daoOutputsSamples.push({ txHash, prepareInputs, txRewardSum, perInputDetails });
+      }
+
+      // 只在 page 日志页打印 tx + 每个 input 的 reward 明细
       if (PRINT_TX && shouldLogPage && pageTxPrinted < PRINT_TX_MAX) {
         pageTxPrinted++;
 
@@ -362,7 +398,7 @@ async function computeWithdraw2Reward() {
 
   const elapsed = ((Date.now() - started) / 1000).toFixed(1);
 
-  // 先打印 multi-input samples（保持你当前顺序诉求）
+  // ✅ 先打印 multi-input samples
   if (multiSamples.length > 0) {
     console.log('--------------------------------');
     console.log('[withdraw2] multi-input samples (per input details):');
@@ -381,7 +417,28 @@ async function computeWithdraw2Reward() {
     }
   }
 
-  // 最后打印 withdraw2 汇总结果
+  // ✅ 新增：打印 outputs 仍含 DAO 的 withdraw2 tx 抽样
+  if (daoOutputsSamples.length > 0) {
+    console.log('--------------------------------');
+    console.log('[withdraw2] samples: withdraw2 txs WITH DAO outputs (not filtered)');
+    for (const s of daoOutputsSamples) {
+      console.log(
+        `[withdraw2-dao-output] tx: ${s.txHash} prepare_inputs=${s.prepareInputs} reward_sum=${formatCKB(s.txRewardSum)} CKB`
+      );
+      for (const d of s.perInputDetails) {
+        console.log(
+          `  [withdraw2-input] tx: ${s.txHash} input_index=${d.input_index}` +
+          ` prev_tx=${d.prev_tx_hash}:${d.prev_index}` +
+          ` deposit_bn=${d.deposit_bn} prepare_bn=${d.prepare_bn}` +
+          ` free=${formatCKB(d.free)} reward=${formatCKB(d.reward)} CKB`
+        );
+      }
+    }
+  } else {
+    console.log('[withdraw2] no withdraw2 tx found that still outputs DAO cells');
+  }
+
+  // ✅ 最后再打印 withdraw2 汇总结果
   console.log('--------------------------------');
   console.log('[withdraw2] done');
   console.log('[withdraw2] seen objects         =', seenObjects);
