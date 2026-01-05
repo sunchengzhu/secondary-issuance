@@ -1,4 +1,4 @@
-import { occupiedCapacity } from './ckb_capacity.js';
+import { occupiedCapacity, formatCKB } from './ckb_capacity.js';
 
 const RPC_URL = process.env.RPC_URL || 'http://127.0.0.1:8114';
 const LIMIT_CELLS = process.env.LIMIT || '0x64'; // get_cells page size
@@ -28,6 +28,11 @@ async function rpc(method, params, { timeoutMs = 30_000, retries = 3 } = {}) {
     }
   }
   throw lastErr;
+}
+
+function lockKey(lock) {
+  if (!lock) return 'null';
+  return `${lock.code_hash}|${lock.hash_type}|${lock.args || '0x'}`;
 }
 
 /* ----------------------- DAO constants ----------------------- */
@@ -65,15 +70,6 @@ async function getIndexerARandS() {
   };
 }
 
-/* ----------------------- Formatting ----------------------- */
-
-function formatCKB(shannons) {
-  const v = shannons < 0n ? -shannons : shannons;
-  const sign = shannons < 0n ? '-' : '';
-  const whole = v / 100_000_000n;
-  const frac = v % 100_000_000n;
-  return `${sign}${whole.toString()}.${frac.toString().padStart(8, '0')}`;
-}
 
 /* ----------------------- get_cells (DAO live) ----------------------- */
 
@@ -130,24 +126,29 @@ async function main() {
 
   const arCache = new Map();
 
-  let daoDeposit = 0n;
   let unclaimedDeposit = 0n;
   let unclaimedPrepare = 0n;
   let cntDeposit = 0;
   let cntPrepare = 0;
   let unclaimedDepositCapacity = 0n;
 
+  // ✅ 地址数量统计（按 lock script 去重）
+  const depositAddrSet = new Set();
+  const prepareAddrSet = new Set();
+  const totalAddrSet = new Set();
+
   for await (const c of getDaoLiveCells()) {
     const cap = BigInt(c.output.capacity);
     const occ = occupiedCapacity(c.output, c.output_data);
     const free = cap - occ;
 
-    daoDeposit += cap;
-    if (free <= 0n) continue;
-
     if (c.output_data === '0x0000000000000000') {
       // ---- deposit cell ----
       cntDeposit++;
+
+      const k = lockKey(c.output.lock);
+      depositAddrSet.add(k);
+      totalAddrSet.add(k);
 
       // ✅ 累加 unclaimed deposit cell 的 capacity
       unclaimedDepositCapacity += cap;
@@ -162,6 +163,10 @@ async function main() {
     } else {
       // ---- prepare-withdraw cell ----
       cntPrepare++;
+
+      const k = lockKey(c.output.lock);
+      prepareAddrSet.add(k);
+      totalAddrSet.add(k);
 
       // deposit height i is stored in output_data
       const depositBnHex = parsePrepareBlockNumberHex(c.output_data);
@@ -178,10 +183,14 @@ async function main() {
   const unclaimedTotal = unclaimedDeposit + unclaimedPrepare;
 
   console.log('--------------------------------');
-  console.log('DAO unclaimed deposit capacity =', formatCKB(unclaimedDepositCapacity), 'CKB');
   console.log('DAO unclaimed rewards deposit =', formatCKB(unclaimedDeposit), 'CKB', `(cells=${cntDeposit})`);
   console.log('DAO unclaimed rewards prepare =', formatCKB(unclaimedPrepare), 'CKB', `(cells=${cntPrepare})`);
   console.log('DAO unclaimed rewards total   =', formatCKB(unclaimedTotal), 'CKB');
+  console.log('--------------------------------');
+  console.log('DAO unclaimed deposit capacity =', formatCKB(unclaimedDepositCapacity), 'CKB');
+  console.log('DAO holder addresses deposit  =', depositAddrSet.size);
+  console.log('DAO holder addresses prepare  =', prepareAddrSet.size);
+  console.log('DAO holder addresses total    =', totalAddrSet.size);
 
   if (unclaimedTotal <= S) {
     const burn = S - unclaimedTotal;
