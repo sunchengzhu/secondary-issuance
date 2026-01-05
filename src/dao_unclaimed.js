@@ -70,6 +70,14 @@ async function getIndexerARandS() {
   };
 }
 
+// timestamp cache by block_number hex
+async function getTimestampByBlockNumberHex(bnHex, tsCache) {
+  if (tsCache.has(bnHex)) return tsCache.get(bnHex);
+  const h = await rpc('get_header_by_number', [bnHex], { timeoutMs: 120_000, retries: 5 });
+  const ts = BigInt(h.timestamp); // hex -> BigInt
+  tsCache.set(bnHex, ts);
+  return ts;
+}
 
 /* ----------------------- get_cells (DAO live) ----------------------- */
 
@@ -126,6 +134,23 @@ async function main() {
 
   const arCache = new Map();
 
+  // ✅ timestamp cache
+  const tsCache = new Map();
+
+  async function getTimestampByBlockNumberHex(bnHex) {
+    if (tsCache.has(bnHex)) return tsCache.get(bnHex);
+    const h = await rpc('get_header_by_number', [bnHex], { timeoutMs: 120_000, retries: 5 });
+    const ts = BigInt(h.timestamp); // ms
+    tsCache.set(bnHex, ts);
+    return ts;
+  }
+
+  // tip timestamp（当前）
+  const tipTs = await getTimestampByBlockNumberHex(heightHex);
+
+  // ✅ deposit 地址 -> “最早存入” 的 timestamp（你要按地址统计就需要这个）
+  const depositAddrMinTs = new Map(); // key: lockKey -> BigInt(ms)
+
   let unclaimedDeposit = 0n;
   let unclaimedPrepare = 0n;
   let cntDeposit = 0;
@@ -149,6 +174,13 @@ async function main() {
       const k = lockKey(c.output.lock);
       depositAddrSet.add(k);
       totalAddrSet.add(k);
+
+      // ✅ 记录该地址的“最早存入时间”（按地址聚合）
+      const depTs = await getTimestampByBlockNumberHex(c.block_number);
+      const old = depositAddrMinTs.get(k);
+      if (old === undefined || depTs < old) {
+        depositAddrMinTs.set(k, depTs);
+      }
 
       // ✅ 累加 unclaimed deposit cell 的 capacity
       unclaimedDepositCapacity += cap;
@@ -186,17 +218,35 @@ async function main() {
   console.log('DAO unclaimed rewards deposit =', formatCKB(unclaimedDeposit), 'CKB', `(cells=${cntDeposit})`);
   console.log('DAO unclaimed rewards prepare =', formatCKB(unclaimedPrepare), 'CKB', `(cells=${cntPrepare})`);
   console.log('DAO unclaimed rewards total   =', formatCKB(unclaimedTotal), 'CKB');
-  console.log('--------------------------------');
-  console.log('DAO unclaimed deposit capacity =', formatCKB(unclaimedDepositCapacity), 'CKB');
-  console.log('DAO holder addresses deposit  =', depositAddrSet.size);
-  console.log('DAO holder addresses prepare  =', prepareAddrSet.size);
-  console.log('DAO holder addresses total    =', totalAddrSet.size);
-
   if (unclaimedTotal <= S) {
     const burn = S - unclaimedTotal;
     console.log('Treasury burn                 =', formatCKB(burn), 'CKB');
   } else {
     console.error('❌ Sanity check failed: UnclaimedDAO > S');
+  }
+  console.log('--------------------------------');
+  console.log('DAO unclaimed deposit capacity =', formatCKB(unclaimedDepositCapacity), 'CKB');
+  console.log('DAO holder addresses deposit  =', depositAddrSet.size);
+  console.log('DAO holder addresses prepare  =', prepareAddrSet.size);
+  console.log('DAO holder addresses total    =', totalAddrSet.size);
+  // ✅ 平均存入天数（按地址：分母 = depositAddrSet.size）
+  let sumDeltaMs = 0n;
+  let addrCount = 0n;
+
+  for (const [k, depTs] of depositAddrMinTs.entries()) {
+    const delta = tipTs - depTs;
+    if (delta >= 0n) {
+      sumDeltaMs += delta;
+      addrCount += 1n;
+    }
+  }
+
+  if (addrCount > 0n) {
+    const avgMs = Number(sumDeltaMs / addrCount);
+    const avgDays = avgMs / 1000 / 60 / 60 / 24;
+    console.log('DAO deposit avg age (days)     =', avgDays.toFixed(2), `(addresses=${addrCount.toString()})`);
+  } else {
+    console.log('DAO deposit avg age (days)     = N/A (addresses=0)');
   }
 }
 
