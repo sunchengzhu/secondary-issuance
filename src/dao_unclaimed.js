@@ -135,6 +135,7 @@ async function main() {
   let unclaimedPrepare = 0n;
   let cntDeposit = 0;
   let cntPrepare = 0;
+  let unclaimedDepositCapacity = 0n;
 
   for await (const c of getDaoLiveCells()) {
     const cap = BigInt(c.output.capacity);
@@ -147,6 +148,9 @@ async function main() {
     if (c.output_data === '0x0000000000000000') {
       // ---- deposit cell ----
       cntDeposit++;
+
+      // ✅ 累加 unclaimed deposit cell 的 capacity
+      unclaimedDepositCapacity += cap;
 
       // deposit height i = c.block_number
       const AR_i = await getARByBlockNumberHex(c.block_number, arCache);
@@ -174,6 +178,7 @@ async function main() {
   const unclaimedTotal = unclaimedDeposit + unclaimedPrepare;
 
   console.log('--------------------------------');
+  console.log('DAO unclaimed deposit capacity =', formatCKB(unclaimedDepositCapacity), 'CKB');
   console.log('DAO unclaimed rewards deposit =', formatCKB(unclaimedDeposit), 'CKB', `(cells=${cntDeposit})`);
   console.log('DAO unclaimed rewards prepare =', formatCKB(unclaimedPrepare), 'CKB', `(cells=${cntPrepare})`);
   console.log('DAO unclaimed rewards total   =', formatCKB(unclaimedTotal), 'CKB');
